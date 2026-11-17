@@ -19,10 +19,6 @@ constexpr Mode defaults[] = {
     {11520, 2160, 60}, {11520, 2160, 144}
 };
 
-// Whether a device or swap chain may be created. `parameters` is false if the
-// game passed no presentation parameters. Only windowed mode is allowed.
-inline bool allowPresentation(bool parameters, bool windowed) { return parameters && windowed; }
-
 // True if `index` addresses one of the `count` modes that are appended after
 // the adapter's `nativeCount` own modes.
 inline bool extraIndex(unsigned nativeCount, unsigned index, unsigned count) {

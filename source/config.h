@@ -16,13 +16,21 @@
 #pragma once
 #include "policy.h"
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
+#include <initializer_list>
 
 namespace rrconfig {
 
 // Hard limits: file size in bytes, and line length in bytes including the
 // terminator (so a line may hold 511 characters).
 constexpr std::size_t maxBytes = 65536, maxLine = 512;
+
+// Accepted refresh rates in Hz, and how many of them one line may list.
+constexpr unsigned minRefresh = 24, maxRefresh = 1000, maxRatesPerLine = 64;
+
+// How many rejected lines are kept for the log.
+constexpr unsigned maxIssues = 32;
 
 // Why a line of the INI was not used. reasonName() turns it into log text.
 enum class Problem { Syntax, SizeOrAspect, Frequency, Capacity, Unknown, LineTooLong };
@@ -36,15 +44,15 @@ struct Config {
     unsigned count = 0;         // used entries in modes
     unsigned duplicates = 0;    // repeated width/height/refresh combinations that were dropped
     unsigned issueCount = 0;    // all problems found
-    unsigned storedIssues = 0;  // problems kept in issues (only the first 32)
-    Issue issues[32]{};
+    unsigned storedIssues = 0;  // problems kept in issues (only the first maxIssues)
+    Issue issues[maxIssues]{};
     bool strict = true;         // the StrictTripleAspect setting
 };
 
-// Records a problem. All are counted, the first 32 are kept for the log.
+// Records a problem. All are counted, the first maxIssues are kept for the log.
 inline void problem(Config& c, unsigned line, Problem reason) {
     ++c.issueCount;
-    if (c.storedIssues < 32) c.issues[c.storedIssues++] = {line, reason};
+    if (c.storedIssues < maxIssues) c.issues[c.storedIssues++] = {line, reason};
 }
 
 inline const char* reasonName(Problem p) {
@@ -119,26 +127,98 @@ struct Lines {
         }
         std::memcpy(out, data + first, n);
         out[n] = 0;
-        for (std::size_t i = 0; i < n; ++i) if (out[i] == ';' || out[i] == '#') {
-            out[i] = 0;
-            break;
+        for (std::size_t i = 0; i < n; ++i) {
+            if (out[i] == ';' || out[i] == '#') {
+                out[i] = 0;
+                break;
+            }
         }
         return true;
     }
 };
 
+// ---- The parts of a file ----
+
+enum class Section { None, Settings, Modes, Other };
+
+// Reads a section header such as "[Modes]". `s` starts at the '['. Records a
+// problem for a header that is malformed or names an unknown section, but
+// only if `report` is set.
+inline Section sectionHeader(Config& c, char* s, unsigned line, bool report) {
+    const std::size_t n = std::strlen(s);
+    if (n < 3 || s[n - 1] != ']') {
+        if (report) problem(c, line, Problem::Syntax);
+        return Section::Other;
+    }
+    s[n - 1] = 0;
+    s = trim(s + 1);
+    if (equal(s, "Settings")) return Section::Settings;
+    if (equal(s, "Modes")) return Section::Modes;
+    if (report) problem(c, line, Problem::Unknown);
+    return Section::Other;
+}
+
+// A line in [Settings]. The only known key is StrictTripleAspect = true|false.
+inline void settingLine(Config& c, const char* key, const char* value, unsigned line) {
+    if (!equal(key, "StrictTripleAspect")) {
+        problem(c, line, Problem::Unknown);
+        return;
+    }
+    if (equal(value, "true")) c.strict = true;
+    else if (equal(value, "false")) c.strict = false;
+    else problem(c, line, Problem::Syntax);
+}
+
+// Reads a comma-separated list of refresh rates such as "60,75,144" into
+// `rates`. Returns how many there are, or 0 if the list is empty, too long,
+// contains anything but numbers in the accepted range, or ends in a comma.
+inline unsigned refreshRates(const char* v, unsigned (&rates)[maxRatesPerLine]) {
+    unsigned count = 0;
+    for (;;) {
+        unsigned hz = 0;
+        if (count == maxRatesPerLine || !number(v, hz) || hz < minRefresh || hz > maxRefresh) return 0;
+        rates[count++] = hz;
+        if (!*v) return count;      // end of the list
+        if (*v++ != ',') return 0;  // something other than a comma follows
+    }
+}
+
 // Adds a mode unless it is already in the list or the list is full.
 inline void add(Config& c, unsigned w, unsigned h, unsigned hz, unsigned line) {
-    for (unsigned i = 0; i < c.count; ++i)
+    for (unsigned i = 0; i < c.count; ++i) {
         if (c.modes[i].width == w && c.modes[i].height == h && c.modes[i].refresh == hz) {
             ++c.duplicates;
             return;
         }
+    }
     if (c.count == rrpolicy::maxModes) {
         problem(c, line, Problem::Capacity);
         return;
     }
     c.modes[c.count++] = {w, h, hz};
+}
+
+// A line in [Modes]: WIDTHxHEIGHT = refresh rates. One bad part rejects the
+// whole line.
+inline void modeLine(Config& c, const char* key, const char* value, unsigned line) {
+    unsigned w = 0, h = 0;
+    const char* k = key;
+    const bool sizeReadable = number(k, w) && (*k == 'x' || *k == 'X') && number(++k, h) && !*k;
+    if (!sizeReadable) {
+        problem(c, line, Problem::Syntax);
+        return;
+    }
+    if (!rrpolicy::validDimensions(w, h, c.strict)) {
+        problem(c, line, Problem::SizeOrAspect);
+        return;
+    }
+    unsigned rates[maxRatesPerLine];
+    const unsigned count = refreshRates(value, rates);
+    if (!count) {
+        problem(c, line, Problem::Frequency);
+        return;
+    }
+    for (unsigned i = 0; i < count; ++i) add(c, w, h, rates[i], line);
 }
 
 // Replaces the mode list with the built-in defaults. Recorded problems stay,
@@ -164,42 +244,36 @@ inline bool parse(const char* data, std::size_t size, Config& c) {
         data += 3;
         size -= 3;
     }
-    for (std::size_t i = 0; i < size; ++i) if (data[i] == 0) return false;
+    for (std::size_t i = 0; i < size; ++i) {
+        if (data[i] == 0) return false;
+    }
 
-    // Two passes make Settings independent of section order: pass 0 reads
-    // only [Settings], pass 1 everything else. That way StrictTripleAspect
-    // applies to all modes, even if [Modes] comes first in the file.
-    for (unsigned pass = 0; pass < 2; ++pass) {
+    // Two passes make Settings independent of section order: the first reads
+    // only [Settings], the second everything else. That way
+    // StrictTripleAspect applies to all modes, even if [Modes] comes first in
+    // the file. Problems outside [Settings] are recorded in the second pass,
+    // so each is counted once.
+    for (const bool settingsPass : {true, false}) {
         Lines lines{data, size};
         char buffer[maxLine];
-        bool longLine = false;
-        enum Section { None, Settings, Modes, Other } section = None;
+        bool tooLong = false;
+        Section section = Section::None;
 
-        while (lines.next(buffer, longLine)) {
-            if (longLine) {
-                if (pass == 1) problem(c, lines.line, Problem::LineTooLong);
+        while (lines.next(buffer, tooLong)) {
+            if (tooLong) {
+                if (!settingsPass) problem(c, lines.line, Problem::LineTooLong);
                 continue;
             }
             char* s = trim(buffer);
             if (!*s) continue;  // empty line or comment only
 
-            // Section header: [Name]
             if (*s == '[') {
-                const std::size_t n = std::strlen(s);
-                if (n < 3 || s[n - 1] != ']') {
-                    section = Other;
-                    if (pass == 1) problem(c, lines.line, Problem::Syntax);
-                    continue;
-                }
-                s[n - 1] = 0;
-                s = trim(s + 1);
-                section = equal(s, "Settings") ? Settings : equal(s, "Modes") ? Modes : Other;
-                if (section == Other && pass == 1) problem(c, lines.line, Problem::Unknown);
+                section = sectionHeader(c, s, lines.line, !settingsPass);
                 continue;
             }
 
             // Leave out the lines that belong to the other pass.
-            if ((pass == 0 && section != Settings) || (pass == 1 && section == Settings)) continue;
+            if ((section == Section::Settings) != settingsPass) continue;
 
             // Everything else must be "key = value".
             char* eq = std::strchr(s, '=');
@@ -208,71 +282,12 @@ inline bool parse(const char* data, std::size_t size, Config& c) {
                 continue;
             }
             *eq = 0;
-            char* key = trim(s);
-            char* value = trim(eq + 1);
+            const char* key = trim(s);
+            const char* value = trim(eq + 1);
 
-            // [Settings]: the only known key is StrictTripleAspect = true|false.
-            if (section == Settings) {
-                if (!equal(key, "StrictTripleAspect")) {
-                    problem(c, lines.line, Problem::Unknown);
-                    continue;
-                }
-                if (equal(value, "true")) c.strict = true;
-                else if (equal(value, "false")) c.strict = false;
-                else problem(c, lines.line, Problem::Syntax);
-                continue;
-            }
-
-            // A key outside any section, or inside an unknown one.
-            if (section != Modes) {
-                problem(c, lines.line, Problem::Unknown);
-                continue;
-            }
-
-            // [Modes]: the key is WIDTHxHEIGHT ...
-            const char* k = key;
-            unsigned w = 0, h = 0;
-            if (!number(k, w) || (*k != 'x' && *k != 'X')) {
-                problem(c, lines.line, Problem::Syntax);
-                continue;
-            }
-            ++k;
-            if (!number(k, h) || *k) {
-                problem(c, lines.line, Problem::Syntax);
-                continue;
-            }
-            if (!rrpolicy::validDimensions(w, h, c.strict)) {
-                problem(c, lines.line, Problem::SizeOrAspect);
-                continue;
-            }
-
-            // ... and the value is a comma-separated list of 1 to 64 refresh
-            // rates from 24 to 1000 Hz. One bad entry rejects the whole line.
-            const char* v = value;
-            unsigned rates[64], count = 0;
-            bool ok = true;
-            do {
-                unsigned hz = 0;
-                if (count == 64 || !number(v, hz) || hz < 24 || hz > 1000) {
-                    ok = false;
-                    break;
-                }
-                rates[count++] = hz;
-                if (!*v) break;  // end of the list
-                if (*v++ != ',') {
-                    ok = false;
-                    break;
-                }
-                if (!*v) {  // comma with nothing after it
-                    ok = false;
-                    break;
-                }
-            } while (true);
-            if (!ok || !count) {
-                problem(c, lines.line, Problem::Frequency);
-                continue;
-            }
-            for (unsigned i = 0; i < count; ++i) add(c, w, h, rates[i], lines.line);
+            if (section == Section::Settings) settingLine(c, key, value, lines.line);
+            else if (section == Section::Modes) modeLine(c, key, value, lines.line);
+            else problem(c, lines.line, Problem::Unknown);  // outside any known section
         }
     }
     return true;

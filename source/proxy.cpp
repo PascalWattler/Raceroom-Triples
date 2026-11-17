@@ -9,8 +9,8 @@
 //   else is forwarded unchanged.
 //
 // How it is put together
-//   1. Start-up: load the real d3d9.dll from the Windows system directory,
-//      work out the log file name and read RaceRoomTriple.ini.
+//   1. Start-up: work out the log file name, load the real d3d9.dll from the
+//      Windows system directory and read RaceRoomTriple.ini.
 //   2. D3DProxy wraps IDirect3D9/IDirect3D9Ex. It extends the mode
 //      enumeration and hands out wrapped devices.
 //   3. DeviceProxy wraps IDirect3DDevice9/IDirect3DDevice9Ex. It refuses
@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <cwchar>
 #include <new>
+#include "version.h"
 #include "policy.h"
 #include "config.h"
 
@@ -41,6 +42,24 @@ static INIT_ONCE initOnce = INIT_ONCE_STATIC_INIT;
 
 // The real Direct3D 9 runtime from the Windows system directory.
 static HMODULE realDll = nullptr;
+
+// The functions of the real d3d9.dll that this DLL exports under the same
+// name, looked up once during start-up. An entry is null if the real DLL
+// could not be loaded or does not have that function.
+static struct RealApi {
+    IDirect3D9* (WINAPI* Direct3DCreate9)(UINT);
+    HRESULT (WINAPI* Direct3DCreate9Ex)(UINT, IDirect3D9Ex**);
+    int (WINAPI* D3DPERF_BeginEvent)(D3DCOLOR, const WCHAR*);
+    int (WINAPI* D3DPERF_EndEvent)();
+    DWORD (WINAPI* D3DPERF_GetStatus)();
+    BOOL (WINAPI* D3DPERF_QueryRepeatFrame)();
+    void (WINAPI* D3DPERF_SetMarker)(D3DCOLOR, const WCHAR*);
+    void (WINAPI* D3DPERF_SetOptions)(DWORD);
+    void (WINAPI* D3DPERF_SetRegion)(D3DCOLOR, const WCHAR*);
+    void (WINAPI* DebugSetMute)();
+    void (WINAPI* Direct3D9EnableMaximizedWindowedModeShim)(BOOL);
+    void* (WINAPI* Direct3DShaderValidatorCreate9)();
+} realApi;
 
 // Full path of this process's log file. Empty means logging is unavailable.
 static wchar_t logPath[MAX_PATH] = {};
@@ -59,7 +78,8 @@ static DWORD configError = 0;
 
 // Full path of RaceRoomTriple.ini. Sized for long paths: 32767 characters
 // plus terminator.
-static wchar_t configPath[32768] = {};
+constexpr DWORD maxPathChars = 32768;
+static wchar_t configPath[maxPathChars] = {};
 
 // Raw contents of the INI file. Static so that 64 KiB do not land on the stack.
 static char configBytes[rrconfig::maxBytes];
@@ -68,136 +88,14 @@ static char configBytes[rrconfig::maxBytes];
 // finds the DLL's own path.
 static char moduleAnchor;
 
-// Becomes 1 once the configuration summary has been written to the log.
-static LONG configPrinted = 0;
-
 // ---------------------------------------------------------------------------
-// Configuration loading
+// Logging
 // ---------------------------------------------------------------------------
-
-// Falls back to the built-in modes and remembers why.
-static void defaults(const char* reason, DWORD error = 0) {
-    configSource = reason;
-    configError = error;
-    rrconfig::defaultModes(configured);
-}
-
-// Reads RaceRoomTriple.ini from the folder this DLL was loaded from, not from
-// the current working directory. Every failure ends in defaults() with a
-// reason that later shows up in the log.
-static void loadConfig() {
-    // Step 1: find the path of this DLL.
-    HMODULE module = nullptr;
-    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                            reinterpret_cast<LPCWSTR>(&moduleAnchor), &module)) {
-        defaults("defaults-module-path", GetLastError());
-        return;
-    }
-    const DWORD n = GetModuleFileNameW(module, configPath, 32768);
-    if (!n || n >= 32768) {  // 0 = failed, 32768 = path was cut off
-        configPath[0] = 0;
-        defaults("defaults-module-path", GetLastError());
-        return;
-    }
-
-    // Step 2: replace the file name (d3d9.dll) with the name of the INI.
-    wchar_t* slash = std::wcsrchr(configPath, L'\\');
-    constexpr wchar_t iniName[] = L"RaceRoomTriple.ini";
-    const std::size_t remaining = slash ? 32768 - std::size_t(slash + 1 - configPath) : 0;
-    if (remaining < sizeof(iniName) / sizeof(iniName[0])) {
-        configPath[0] = 0;
-        defaults("defaults-module-path");
-        return;
-    }
-    wcscpy_s(slash + 1, remaining, iniName);
-
-    // Step 3: open read-only. Full sharing, so an editor that still has the
-    // file open does not block us.
-    HANDLE file = CreateFileW(configPath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) {
-        const DWORD error = GetLastError();
-        defaults(error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ? "defaults-ini-missing" : "defaults-open-error", error);
-        return;
-    }
-
-    // Step 4: read the whole file at once. Anything larger than the buffer is
-    // refused.
-    LARGE_INTEGER size = {};
-    if (!GetFileSizeEx(file, &size) || size.QuadPart < 0 || size.QuadPart > static_cast<LONGLONG>(rrconfig::maxBytes)) {
-        configError = GetLastError();
-        CloseHandle(file);
-        defaults("defaults-file-size", configError);
-        return;
-    }
-    DWORD read = 0;
-    const BOOL ok = ReadFile(file, configBytes, static_cast<DWORD>(size.QuadPart), &read, nullptr);
-    const DWORD error = ok ? 0 : GetLastError();
-    CloseHandle(file);
-    if (!ok || read != static_cast<DWORD>(size.QuadPart)) {
-        defaults("defaults-read-error", error);
-        return;
-    }
-
-    // Step 5: parse. An INI without a single usable mode counts as unusable.
-    if (!rrconfig::parse(configBytes, read, configured)) {
-        defaults("defaults-invalid-encoding/size");
-        return;
-    }
-    if (!configured.count) {
-        defaults("defaults-no-valid-modes");
-        return;
-    }
-    configSource = "ini";
-}
-
-// Defined further down, after note(), which it uses.
-static void configSummary();
-
-// ---------------------------------------------------------------------------
-// Start-up and logging
-// ---------------------------------------------------------------------------
-
-// One-time start-up, run through initOnce. It must not call note(): note()
-// enters initOnce itself and would recurse. That is why the configuration
-// summary is written later, from symbol().
-//
-// Returns FALSE if the real d3d9.dll could not be loaded. Windows then treats
-// start-up as not done and runs it again on the next call.
-static BOOL CALLBACK init(PINIT_ONCE, PVOID, PVOID*) {
-    // The real runtime, by absolute path, so that we never load ourselves.
-    wchar_t sys[MAX_PATH];
-    UINT n = GetSystemDirectoryW(sys, MAX_PATH);
-    if (!n || n > MAX_PATH - 12) return FALSE;  // keep room for "\d3d9.dll"
-    wcscat_s(sys, L"\\d3d9.dll");
-    realDll = LoadLibraryW(sys);
-
-    // Log file: %LOCALAPPDATA%\RaceRoomTripleHelper\d3d9-<process id>.log
-    wchar_t dir[MAX_PATH];
-    DWORD k = GetEnvironmentVariableW(L"LOCALAPPDATA", dir, MAX_PATH);
-    if (k && k < MAX_PATH - 30) {
-        wcscat_s(dir, L"\\RaceRoomTripleHelper");
-        CreateDirectoryW(dir, nullptr);
-        swprintf_s(logPath, L"%ls\\d3d9-%lu.log", dir, GetCurrentProcessId());
-    }
-
-    loadConfig();
-    return realDll != nullptr;
-}
-
-// Looks up a function of the real d3d9.dll by name. Every exported function of
-// this DLL comes through here first, so this is also where start-up is
-// triggered and where the configuration summary is logged, once.
-static FARPROC symbol(const char* name) {
-    InitOnceExecuteOnce(&initOnce, init, nullptr, nullptr);
-    if (realDll && InterlockedCompareExchange(&configPrinted, 1, 0) == 0) configSummary();
-    return realDll ? GetProcAddress(realDll, name) : nullptr;
-}
 
 // Appends one printf-style line with a time stamp to the log file. The file is
 // opened and closed for every line, so nothing is lost if the game crashes.
+// Does nothing until start-up has set logPath.
 static void note(const char* fmt, ...) {
-    InitOnceExecuteOnce(&initOnce, init, nullptr, nullptr);
     if (!logPath[0]) return;
 
     char message[1024];
@@ -222,12 +120,116 @@ static void note(const char* fmt, ...) {
     ReleaseSRWLockExclusive(&logLock);
 }
 
+// Sets logPath to %LOCALAPPDATA%\RaceRoomTripleHelper\d3d9-<process id>.log.
+// Leaves it empty if the path would not fit.
+static void prepareLogPath() {
+    constexpr wchar_t folder[] = L"\\RaceRoomTripleHelper";
+    constexpr wchar_t longestFile[] = L"\\d3d9-4294967295.log";
+    wchar_t dir[MAX_PATH];
+    const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", dir, MAX_PATH);
+    if (!n || n + std::wcslen(folder) + std::wcslen(longestFile) >= MAX_PATH) return;
+    wcscat_s(dir, folder);
+    CreateDirectoryW(dir, nullptr);
+    swprintf_s(logPath, L"%ls\\d3d9-%lu.log", dir, GetCurrentProcessId());
+}
+
+// ---------------------------------------------------------------------------
+// Configuration loading
+// ---------------------------------------------------------------------------
+
+// Falls back to the built-in modes and remembers why.
+static void defaults(const char* reason, DWORD error = 0) {
+    configSource = reason;
+    configError = error;
+    rrconfig::defaultModes(configured);
+}
+
+// Reads RaceRoomTriple.ini from the folder this DLL was loaded from, not from
+// the current working directory. Every failure ends in defaults() with a
+// reason that shows up in the log.
+static void loadConfig() {
+    // Step 1: find the path of this DLL.
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(&moduleAnchor), &module)) {
+        defaults("defaults-module-path", GetLastError());
+        return;
+    }
+    const DWORD n = GetModuleFileNameW(module, configPath, maxPathChars);
+    if (!n || n >= maxPathChars) {  // 0 = failed, full buffer = path was cut off
+        const DWORD error = GetLastError();
+        configPath[0] = 0;
+        defaults("defaults-module-path", error);
+        return;
+    }
+
+    // Step 2: replace the file name (d3d9.dll) with the name of the INI.
+    wchar_t* slash = std::wcsrchr(configPath, L'\\');
+    constexpr wchar_t iniName[] = L"RaceRoomTriple.ini";
+    const std::size_t remaining = slash ? maxPathChars - std::size_t(slash + 1 - configPath) : 0;
+    if (remaining < sizeof(iniName) / sizeof(iniName[0])) {
+        configPath[0] = 0;
+        defaults("defaults-module-path");
+        return;
+    }
+    wcscpy_s(slash + 1, remaining, iniName);
+
+    // Step 3: open read-only. Full sharing, so an editor that still has the
+    // file open does not block us.
+    HANDLE file = CreateFileW(configPath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        const DWORD error = GetLastError();
+        defaults(error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ? "defaults-ini-missing" : "defaults-open-error", error);
+        return;
+    }
+
+    // Step 4: read the whole file at once. Anything larger than the buffer is
+    // refused.
+    LARGE_INTEGER size = {};
+    if (!GetFileSizeEx(file, &size)) {
+        const DWORD error = GetLastError();
+        CloseHandle(file);
+        defaults("defaults-file-size", error);
+        return;
+    }
+    if (size.QuadPart < 0 || size.QuadPart > static_cast<LONGLONG>(rrconfig::maxBytes)) {
+        CloseHandle(file);
+        defaults("defaults-file-too-large");
+        return;
+    }
+    DWORD read = 0;
+    const BOOL ok = ReadFile(file, configBytes, static_cast<DWORD>(size.QuadPart), &read, nullptr);
+    const DWORD error = ok ? 0 : GetLastError();
+    CloseHandle(file);
+    if (!ok || read != static_cast<DWORD>(size.QuadPart)) {
+        defaults("defaults-read-error", error);
+        return;
+    }
+
+    // Step 5: parse. An INI without a single usable mode counts as unusable.
+    if (!rrconfig::parse(configBytes, read, configured)) {
+        defaults("defaults-invalid-encoding/size");
+        return;
+    }
+    if (!configured.count) {
+        defaults("defaults-no-valid-modes");
+        return;
+    }
+    configSource = "ini";
+}
+
 // Writes what was loaded to the log: where the modes came from, which INI
 // lines were ignored and why, and the final list of modes.
 static void configSummary() {
-    note("CONFIG version=0.4 source=%s count=%u strict48x9=%u duplicates=%u issues=%u winerror=%lu",
+    note("CONFIG version=" RRT_VERSION " source=%s count=%u strict48x9=%u duplicates=%u issues=%u winerror=%lu",
          configSource, configured.count, configured.strict, configured.duplicates, configured.issueCount, configError);
-    if (configPath[0]) note("CONFIG path=%ls", configPath);
+
+    // The path as UTF-8, so that folder names in any language survive.
+    char path[900];
+    if (configPath[0] && WideCharToMultiByte(CP_UTF8, 0, configPath, -1, path, sizeof(path), nullptr, nullptr))
+        note("CONFIG path=%s", path);
+
     for (unsigned i = 0; i < configured.storedIssues; ++i)
         note("CONFIG ignored/problem line=%u reason=%s", configured.issues[i].line, rrconfig::reasonName(configured.issues[i].reason));
     for (unsigned i = 0; i < configured.count; ++i) {
@@ -235,6 +237,71 @@ static void configSummary() {
         note("CONFIG mode=%ux%u@%u", m.width, m.height, m.refresh);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Start-up
+// ---------------------------------------------------------------------------
+
+// Stores the address of one function of the real DLL in its RealApi entry.
+// The detour through void* is the usual way to turn the untyped address from
+// GetProcAddress into a typed function pointer.
+template <class Fn>
+static void resolve(Fn& entry, const char* name) {
+    entry = reinterpret_cast<Fn>(reinterpret_cast<void*>(GetProcAddress(realDll, name)));
+}
+
+// Loads the real runtime by absolute path, so that we never load ourselves,
+// and fills realApi.
+static void loadRealDll() {
+    constexpr wchar_t fileName[] = L"\\d3d9.dll";
+    wchar_t path[MAX_PATH];
+    const UINT n = GetSystemDirectoryW(path, MAX_PATH);
+    if (!n || n + std::wcslen(fileName) >= MAX_PATH) {
+        note("ERROR: Windows system directory not available");
+        return;
+    }
+    wcscat_s(path, fileName);
+    realDll = LoadLibraryW(path);
+    if (!realDll) {
+        note("ERROR: real d3d9.dll not loaded, winerror=%lu", GetLastError());
+        return;
+    }
+#define RESOLVE(name) resolve(realApi.name, #name)
+    RESOLVE(Direct3DCreate9);
+    RESOLVE(Direct3DCreate9Ex);
+    RESOLVE(D3DPERF_BeginEvent);
+    RESOLVE(D3DPERF_EndEvent);
+    RESOLVE(D3DPERF_GetStatus);
+    RESOLVE(D3DPERF_QueryRepeatFrame);
+    RESOLVE(D3DPERF_SetMarker);
+    RESOLVE(D3DPERF_SetOptions);
+    RESOLVE(D3DPERF_SetRegion);
+    RESOLVE(DebugSetMute);
+    RESOLVE(Direct3D9EnableMaximizedWindowedModeShim);
+    RESOLVE(Direct3DShaderValidatorCreate9);
+#undef RESOLVE
+}
+
+// One-time start-up, run through initOnce. The log comes first so that the
+// other steps can report problems.
+static BOOL CALLBACK init(PINIT_ONCE, PVOID, PVOID*) {
+    prepareLogPath();
+    loadRealDll();
+    loadConfig();
+    configSummary();
+    return TRUE;
+}
+
+// The functions of the real d3d9.dll. Every exported function of this DLL
+// starts here, which is what triggers start-up on the first call.
+static const RealApi& api() {
+    InitOnceExecuteOnce(&initOnce, init, nullptr, nullptr);
+    return realApi;
+}
+
+// ---------------------------------------------------------------------------
+// Checks shared by D3DProxy and DeviceProxy
+// ---------------------------------------------------------------------------
 
 // The gate for every call that creates or resets a swap chain. Logs the
 // request and refuses exclusive fullscreen, because the added modes do not
@@ -245,7 +312,7 @@ static bool allowed(D3DPRESENT_PARAMETERS* p, const char* where) {
         return false;
     }
     note("%s: requested %ux%u Windowed=%u Hz=%u", where, p->BackBufferWidth, p->BackBufferHeight, p->Windowed, p->FullScreen_RefreshRateInHz);
-    if (!rrpolicy::allowPresentation(true, p->Windowed != FALSE)) {
+    if (!p->Windowed) {
         note("BLOCKED: exclusive fullscreen is not supported by this experimental wrapper");
         return false;
     }
@@ -269,6 +336,10 @@ class DeviceProxy final : public IDirect3DDevice9Ex {
     LONG refs = 1;                     // COM reference count of this wrapper
     unsigned lastW = 0, lastH = 0;     // back buffer size last written to the log
     unsigned frames = 0;               // Present calls so far, for the periodic size check
+    LONG refusedQueries = 0;           // QueryInterface refusals so far, to limit log lines
+
+    // How many refused QueryInterface calls are written to the log.
+    static constexpr LONG loggedRefusals = 16;
 
 public:
     // Takes over the caller's reference to `r`.
@@ -302,7 +373,8 @@ public:
 
     // Only the interfaces this class implements are answered. Anything else is
     // refused instead of being passed to the real device, which would hand
-    // out an unwrapped object.
+    // out an unwrapped object. The first refusals are logged with the
+    // interface ID, so an incompatible overlay or tool can be identified.
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void** out) noexcept override {
         if (!out) return E_POINTER;
         *out = nullptr;
@@ -311,7 +383,10 @@ public:
             AddRef();
             return S_OK;
         }
-        note("Device QueryInterface: unsupported interface rejected");
+        if (InterlockedIncrement(&refusedQueries) <= loggedRefusals)
+            note("Device QueryInterface: unsupported interface {%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X} rejected",
+                 (unsigned long)id.Data1, id.Data2, id.Data3, id.Data4[0], id.Data4[1],
+                 id.Data4[2], id.Data4[3], id.Data4[4], id.Data4[5], id.Data4[6], id.Data4[7]);
         return E_NOINTERFACE;
     }
     ULONG STDMETHODCALLTYPE AddRef() noexcept override { return (ULONG)InterlockedIncrement(&refs); }
@@ -340,9 +415,10 @@ public:
         return hr;
     }
 
-    // `mode` describes a fullscreen display mode. Fullscreen has been refused
-    // by allowed(), so NULL is passed on, as Direct3D expects for windowed mode.
-    HRESULT STDMETHODCALLTYPE ResetEx(D3DPRESENT_PARAMETERS* p, D3DDISPLAYMODEEX* mode) noexcept override {
+    // The last parameter describes a fullscreen display mode. Fullscreen has
+    // been refused by allowed(), so it is ignored and NULL is passed on, as
+    // Direct3D expects for windowed mode.
+    HRESULT STDMETHODCALLTYPE ResetEx(D3DPRESENT_PARAMETERS* p, D3DDISPLAYMODEEX* /*fullscreenMode*/) noexcept override {
         if (!ex || !allowed(p, "ResetEx")) return D3DERR_INVALIDCALL;
         HRESULT hr = ex->ResetEx(p, nullptr);
         note("ResetEx result=0x%08lx", (unsigned long)hr);
@@ -357,7 +433,9 @@ public:
         return real->CreateAdditionalSwapChain(p, out);
     }
 
-    // Every 300th frame, check whether the back buffer size has changed.
+    // Every 300th frame, check whether the back buffer size has changed. This
+    // also catches a resize that went past Reset() above, through the real
+    // device (see "Known limit").
     HRESULT STDMETHODCALLTYPE Present(const RECT* a, const RECT* b, HWND c, const RGNDATA* d) noexcept override {
         if ((frames++ % 300) == 0) Report();
         return real->Present(a, b, c, d);
@@ -520,22 +598,43 @@ class D3DProxy final : public IDirect3D9Ex {
     unsigned selected[rrpolicy::maxAdapters][rrpolicy::maxModes]{};
     unsigned counts[rrpolicy::maxAdapters]{};
 
-    // Number of added modes for an adapter and display format. Zero if the
-    // adapter has no mode of its own in that format, so that formats it does
-    // not support stay unsupported.
-    unsigned added(UINT a, D3DFORMAT f) {
-        return a < adapterCount && real->GetAdapterModeCount(a, f) > 0 ? counts[a] : 0;
+    // Number of added modes for adapter `a`, given how many modes of its own
+    // it has in the requested format. Zero if it has none, so that formats
+    // the adapter does not support stay unsupported.
+    unsigned added(UINT a, UINT native) const {
+        return a < adapterCount && native > 0 ? counts[a] : 0;
     }
 
     // The same for the Ex enumeration. Our modes are progressive, so a filter
     // that asks for interlaced modes only gets none of them.
-    unsigned addedEx(UINT a, const D3DDISPLAYMODEFILTER* f) {
-        return ex && f && a < adapterCount && ex->GetAdapterModeCountEx(a, f) > 0 &&
-            (f->ScanLineOrdering == D3DSCANLINEORDERING_UNKNOWN || f->ScanLineOrdering == D3DSCANLINEORDERING_PROGRESSIVE) ? counts[a] : 0;
+    unsigned addedEx(UINT a, const D3DDISPLAYMODEFILTER* f, UINT native) const {
+        if (!f) return 0;
+        const bool progressive = f->ScanLineOrdering == D3DSCANLINEORDERING_UNKNOWN ||
+                                 f->ScanLineOrdering == D3DSCANLINEORDERING_PROGRESSIVE;
+        return progressive ? added(a, native) : 0;
     }
 
     // The i-th added mode of adapter a.
-    const rrpolicy::Mode& mode(UINT a, UINT i) { return configured.modes[selected[a][i]]; }
+    const rrpolicy::Mode& mode(UINT a, UINT i) const { return configured.modes[selected[a][i]]; }
+
+    // Shared check for CreateDevice and CreateDeviceEx: windowed only, and no
+    // adapter-group device (one device driving several fullscreen outputs).
+    bool mayCreate(D3DPRESENT_PARAMETERS* p, DWORD flags, const char* where) {
+        if (!allowed(p, where)) return false;
+        if (flags & D3DCREATE_ADAPTERGROUP_DEVICE) {
+            note("BLOCKED: adapter-group device");
+            return false;
+        }
+        return true;
+    }
+
+    // Wraps a real device that was just created. If there is no memory for
+    // the wrapper, the real device is released and null is returned.
+    DeviceProxy* wrapDevice(IDirect3DDevice9* dev) {
+        DeviceProxy* wrap = new (std::nothrow) DeviceProxy(dev, this);
+        if (!wrap) dev->Release();
+        return wrap;
+    }
 
 public:
     // Takes over the caller's reference to `r`. Decides once, per adapter,
@@ -559,7 +658,7 @@ public:
             note("CAPS adapter=%u maxTexture=%ux%u result=0x%08lx offered=%u", a, maxW, maxH, (unsigned long)hr, counts[a]);
         }
         if (total > adapterCount) note("CAPS adapters above %u keep native modes only", adapterCount);
-        note("D3DProxy created; Ex=%u; version=0.4; windowed only", ex != nullptr);
+        note("D3DProxy created; Ex=%u; version=" RRT_VERSION "; windowed only", ex != nullptr);
     }
     ~D3DProxy() {
         if (ex) ex->Release();
@@ -588,49 +687,47 @@ public:
     // ---- Mode enumeration: the adapter's modes plus ours ----
 
     UINT STDMETHODCALLTYPE GetAdapterModeCount(UINT a, D3DFORMAT f) noexcept override {
-        const UINT n = real->GetAdapterModeCount(a, f), extra = added(a, f);
-        note("GetAdapterModeCount adapter=%u format=%u native=%u added=%u", a, f, n, extra);
-        return n + extra;
+        const UINT native = real->GetAdapterModeCount(a, f);
+        const UINT extra = added(a, native);
+        note("GetAdapterModeCount adapter=%u format=%u native=%u added=%u", a, f, native, extra);
+        return native + extra;
     }
 
     // Indices past the adapter's own modes are answered from the configuration.
     HRESULT STDMETHODCALLTYPE EnumAdapterModes(UINT a, D3DFORMAT f, UINT i, D3DDISPLAYMODE* out) noexcept override {
-        const UINT n = real->GetAdapterModeCount(a, f), extra = added(a, f);
-        if (rrpolicy::extraIndex(n, i, extra)) {
-            if (!out) return D3DERR_INVALIDCALL;
-            const auto& m = mode(a, i - n);
-            out->Width = m.width;
-            out->Height = m.height;
-            out->RefreshRate = m.refresh;
-            out->Format = f;
-            note("EnumAdapterModes: offered %ux%u@%u adapter=%u", out->Width, out->Height, out->RefreshRate, a);
-            return S_OK;
-        }
-        return real->EnumAdapterModes(a, f, i, out);
+        const UINT native = real->GetAdapterModeCount(a, f);
+        if (!rrpolicy::extraIndex(native, i, added(a, native))) return real->EnumAdapterModes(a, f, i, out);
+        if (!out) return D3DERR_INVALIDCALL;
+        const auto& m = mode(a, i - native);
+        out->Width = m.width;
+        out->Height = m.height;
+        out->RefreshRate = m.refresh;
+        out->Format = f;
+        note("EnumAdapterModes: offered %ux%u@%u adapter=%u", out->Width, out->Height, out->RefreshRate, a);
+        return S_OK;
     }
 
     UINT STDMETHODCALLTYPE GetAdapterModeCountEx(UINT a, const D3DDISPLAYMODEFILTER* f) noexcept override {
         if (!ex) return 0;
-        const UINT n = ex->GetAdapterModeCountEx(a, f), extra = addedEx(a, f);
-        note("GetAdapterModeCountEx adapter=%u native=%u added=%u", a, n, extra);
-        return n + extra;
+        const UINT native = ex->GetAdapterModeCountEx(a, f);
+        const UINT extra = addedEx(a, f, native);
+        note("GetAdapterModeCountEx adapter=%u native=%u added=%u", a, native, extra);
+        return native + extra;
     }
 
     HRESULT STDMETHODCALLTYPE EnumAdapterModesEx(UINT a, const D3DDISPLAYMODEFILTER* f, UINT i, D3DDISPLAYMODEEX* out) noexcept override {
         if (!ex) return D3DERR_INVALIDCALL;
-        const UINT n = ex->GetAdapterModeCountEx(a, f), extra = addedEx(a, f);
-        if (rrpolicy::extraIndex(n, i, extra)) {
-            if (!out || out->Size != sizeof(*out)) return D3DERR_INVALIDCALL;
-            const auto& m = mode(a, i - n);
-            out->Width = m.width;
-            out->Height = m.height;
-            out->RefreshRate = m.refresh;
-            out->Format = f->Format;
-            out->ScanLineOrdering = D3DSCANLINEORDERING_PROGRESSIVE;
-            note("EnumAdapterModesEx: offered %ux%u@%u adapter=%u", out->Width, out->Height, out->RefreshRate, a);
-            return S_OK;
-        }
-        return ex->EnumAdapterModesEx(a, f, i, out);
+        const UINT native = ex->GetAdapterModeCountEx(a, f);
+        if (!rrpolicy::extraIndex(native, i, addedEx(a, f, native))) return ex->EnumAdapterModesEx(a, f, i, out);
+        if (!out || out->Size != sizeof(*out)) return D3DERR_INVALIDCALL;
+        const auto& m = mode(a, i - native);
+        out->Width = m.width;
+        out->Height = m.height;
+        out->RefreshRate = m.refresh;
+        out->Format = f->Format;
+        out->ScanLineOrdering = D3DSCANLINEORDERING_PROGRESSIVE;
+        note("EnumAdapterModesEx: offered %ux%u@%u adapter=%u", out->Width, out->Height, out->RefreshRate, a);
+        return S_OK;
     }
 
     // ---- Device creation: windowed only, result wrapped in a DeviceProxy ----
@@ -638,45 +735,30 @@ public:
     HRESULT STDMETHODCALLTYPE CreateDevice(UINT a, D3DDEVTYPE t, HWND w, DWORD flags, D3DPRESENT_PARAMETERS* p, IDirect3DDevice9** out) noexcept override {
         if (!out) return E_POINTER;
         *out = nullptr;
-        if (!allowed(p, "CreateDevice")) return D3DERR_INVALIDCALL;
-        if (flags & D3DCREATE_ADAPTERGROUP_DEVICE) {
-            note("BLOCKED: adapter-group device");
-            return D3DERR_INVALIDCALL;
-        }
+        if (!mayCreate(p, flags, "CreateDevice")) return D3DERR_INVALIDCALL;
         IDirect3DDevice9* dev = nullptr;
         HRESULT hr = real->CreateDevice(a, t, w, flags, p, &dev);
         note("CreateDevice result=0x%08lx", (unsigned long)hr);
         if (SUCCEEDED(hr) && dev) {
-            DeviceProxy* wrap = new (std::nothrow) DeviceProxy(dev, this);
-            if (!wrap) {
-                dev->Release();
-                return E_OUTOFMEMORY;
-            }
-            *out = wrap;
+            *out = wrapDevice(dev);
+            if (!*out) return E_OUTOFMEMORY;
         }
         return hr;
     }
 
-    // `mode` describes a fullscreen display mode. Fullscreen has been refused
-    // by allowed(), so NULL is passed on, as Direct3D expects for windowed mode.
-    HRESULT STDMETHODCALLTYPE CreateDeviceEx(UINT a, D3DDEVTYPE t, HWND w, DWORD flags, D3DPRESENT_PARAMETERS* p, D3DDISPLAYMODEEX* mode, IDirect3DDevice9Ex** out) noexcept override {
+    // The parameter before `out` describes a fullscreen display mode.
+    // Fullscreen has been refused by mayCreate(), so it is ignored and NULL
+    // is passed on, as Direct3D expects for windowed mode.
+    HRESULT STDMETHODCALLTYPE CreateDeviceEx(UINT a, D3DDEVTYPE t, HWND w, DWORD flags, D3DPRESENT_PARAMETERS* p, D3DDISPLAYMODEEX* /*fullscreenMode*/, IDirect3DDevice9Ex** out) noexcept override {
         if (!out) return E_POINTER;
         *out = nullptr;
-        if (!ex || !allowed(p, "CreateDeviceEx")) return D3DERR_INVALIDCALL;
-        if (flags & D3DCREATE_ADAPTERGROUP_DEVICE) {
-            note("BLOCKED: adapter-group device");
-            return D3DERR_INVALIDCALL;
-        }
+        if (!ex || !mayCreate(p, flags, "CreateDeviceEx")) return D3DERR_INVALIDCALL;
         IDirect3DDevice9Ex* dev = nullptr;
         HRESULT hr = ex->CreateDeviceEx(a, t, w, flags, p, nullptr, &dev);
         note("CreateDeviceEx result=0x%08lx", (unsigned long)hr);
         if (SUCCEEDED(hr) && dev) {
-            DeviceProxy* wrap = new (std::nothrow) DeviceProxy(dev, this);
-            if (!wrap) {
-                dev->Release();
-                return E_OUTOFMEMORY;
-            }
-            *out = wrap;
+            *out = wrapDevice(dev);
+            if (!*out) return E_OUTOFMEMORY;
         }
         return hr;
     }
@@ -702,33 +784,32 @@ public:
 };
 
 // ---------------------------------------------------------------------------
-// Exported functions. exports.def lists them for the linker. Each one looks
-// up the function of the same name in the real d3d9.dll.
+// Exported functions. exports.def lists them for the linker. Each one calls
+// the function of the same name in the real d3d9.dll.
 // ---------------------------------------------------------------------------
-#define EXPORT extern "C"
+extern "C" {
 
 // The two entry points that matter: create the real Direct3D object and hand
 // back our wrapper around it.
-EXPORT IDirect3D9* WINAPI Direct3DCreate9(UINT sdk) {
-    typedef IDirect3D9*(WINAPI* Fn)(UINT);
-    auto fn = (Fn)symbol("Direct3DCreate9");
-    if (!fn) return nullptr;
+IDirect3D9* WINAPI Direct3DCreate9(UINT sdk) {
+    const auto create = api().Direct3DCreate9;
+    if (!create) return nullptr;
     note("Direct3DCreate9 called, SDK=%u", sdk);
-    IDirect3D9* real = fn(sdk);
+    IDirect3D9* real = create(sdk);
     if (!real) return nullptr;
     auto wrap = new (std::nothrow) D3DProxy(real);
     if (!wrap) real->Release();
     return wrap;
 }
-EXPORT HRESULT WINAPI Direct3DCreate9Ex(UINT sdk, IDirect3D9Ex** out) {
+
+HRESULT WINAPI Direct3DCreate9Ex(UINT sdk, IDirect3D9Ex** out) {
     if (!out) return E_POINTER;
     *out = nullptr;
-    typedef HRESULT(WINAPI* Fn)(UINT, IDirect3D9Ex**);
-    auto fn = (Fn)symbol("Direct3DCreate9Ex");
-    if (!fn) return D3DERR_NOTAVAILABLE;
+    const auto create = api().Direct3DCreate9Ex;
+    if (!create) return D3DERR_NOTAVAILABLE;
     note("Direct3DCreate9Ex called, SDK=%u", sdk);
     IDirect3D9Ex* real = nullptr;
-    HRESULT hr = fn(sdk, &real);
+    HRESULT hr = create(sdk, &real);
     if (FAILED(hr)) return hr;
     auto wrap = new (std::nothrow) D3DProxy(real);
     if (!wrap) {
@@ -741,13 +822,45 @@ EXPORT HRESULT WINAPI Direct3DCreate9Ex(UINT sdk, IDirect3D9Ex** out) {
 
 // Debugging and profiling helpers that programs expect to find in d3d9.dll.
 // Passed through unchanged; if the real DLL lacks one, the call does nothing.
-EXPORT int WINAPI D3DPERF_BeginEvent(D3DCOLOR a,const WCHAR* b){typedef int(WINAPI*Fn)(D3DCOLOR,const WCHAR*);auto fn=(Fn)symbol("D3DPERF_BeginEvent");return fn?fn(a,b):0;}
-EXPORT int WINAPI D3DPERF_EndEvent(){typedef int(WINAPI*Fn)();auto fn=(Fn)symbol("D3DPERF_EndEvent");return fn?fn():0;}
-EXPORT DWORD WINAPI D3DPERF_GetStatus(){typedef DWORD(WINAPI*Fn)();auto fn=(Fn)symbol("D3DPERF_GetStatus");return fn?fn():0;}
-EXPORT BOOL WINAPI D3DPERF_QueryRepeatFrame(){typedef BOOL(WINAPI*Fn)();auto fn=(Fn)symbol("D3DPERF_QueryRepeatFrame");return fn?fn():FALSE;}
-EXPORT void WINAPI D3DPERF_SetMarker(D3DCOLOR a,const WCHAR* b){typedef void(WINAPI*Fn)(D3DCOLOR,const WCHAR*);auto fn=(Fn)symbol("D3DPERF_SetMarker");if(fn)fn(a,b);}
-EXPORT void WINAPI D3DPERF_SetOptions(DWORD a){typedef void(WINAPI*Fn)(DWORD);auto fn=(Fn)symbol("D3DPERF_SetOptions");if(fn)fn(a);}
-EXPORT void WINAPI D3DPERF_SetRegion(D3DCOLOR a,const WCHAR* b){typedef void(WINAPI*Fn)(D3DCOLOR,const WCHAR*);auto fn=(Fn)symbol("D3DPERF_SetRegion");if(fn)fn(a,b);}
-EXPORT void WINAPI DebugSetMute(){typedef void(WINAPI*Fn)();auto fn=(Fn)symbol("DebugSetMute");if(fn)fn();}
-EXPORT void WINAPI Direct3D9EnableMaximizedWindowedModeShim(BOOL a){typedef void(WINAPI*Fn)(BOOL);auto fn=(Fn)symbol("Direct3D9EnableMaximizedWindowedModeShim");if(fn)fn(a);}
-EXPORT void* WINAPI Direct3DShaderValidatorCreate9(){typedef void*(WINAPI*Fn)();auto fn=(Fn)symbol("Direct3DShaderValidatorCreate9");return fn?fn():nullptr;}
+int WINAPI D3DPERF_BeginEvent(D3DCOLOR color, const WCHAR* name) {
+    const auto fn = api().D3DPERF_BeginEvent;
+    return fn ? fn(color, name) : 0;
+}
+int WINAPI D3DPERF_EndEvent() {
+    const auto fn = api().D3DPERF_EndEvent;
+    return fn ? fn() : 0;
+}
+DWORD WINAPI D3DPERF_GetStatus() {
+    const auto fn = api().D3DPERF_GetStatus;
+    return fn ? fn() : 0;
+}
+BOOL WINAPI D3DPERF_QueryRepeatFrame() {
+    const auto fn = api().D3DPERF_QueryRepeatFrame;
+    return fn ? fn() : FALSE;
+}
+void WINAPI D3DPERF_SetMarker(D3DCOLOR color, const WCHAR* name) {
+    const auto fn = api().D3DPERF_SetMarker;
+    if (fn) fn(color, name);
+}
+void WINAPI D3DPERF_SetOptions(DWORD options) {
+    const auto fn = api().D3DPERF_SetOptions;
+    if (fn) fn(options);
+}
+void WINAPI D3DPERF_SetRegion(D3DCOLOR color, const WCHAR* name) {
+    const auto fn = api().D3DPERF_SetRegion;
+    if (fn) fn(color, name);
+}
+void WINAPI DebugSetMute() {
+    const auto fn = api().DebugSetMute;
+    if (fn) fn();
+}
+void WINAPI Direct3D9EnableMaximizedWindowedModeShim(BOOL enable) {
+    const auto fn = api().Direct3D9EnableMaximizedWindowedModeShim;
+    if (fn) fn(enable);
+}
+void* WINAPI Direct3DShaderValidatorCreate9() {
+    const auto fn = api().Direct3DShaderValidatorCreate9;
+    return fn ? fn() : nullptr;
+}
+
+}  // extern "C"
