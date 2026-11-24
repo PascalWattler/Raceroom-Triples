@@ -74,6 +74,17 @@ int main(int argc, char** argv) {
     c = parseText("[Modes]\n7680x1440=60\n[Settings]\nStrictTripleAspect=garbage\nUnknown=1\n[Wrong]\nThing=60\n");
     CHECK(c.count == 1 && c.issueCount == 4 && c.strict);
 
+    // The renderer: Direct3D 9 unless the INI asks for DXVK, in any case and
+    // in any section order. A value that is neither is reported and ignored.
+    c = parseText("[Modes]\n7680x1440=60\n");
+    CHECK(c.renderer == Renderer::DirectX9);
+    c = parseText("[Modes]\n7680x1440=60\n[Settings]\nRenderer = DXVK\n");
+    CHECK(c.renderer == Renderer::Dxvk && c.count == 1 && !c.issueCount && c.strict);
+    c = parseText("[Settings]\nRenderer=dxvk\nRenderer=dx9\n[Modes]\n7680x1440=60\n");
+    CHECK(c.renderer == Renderer::DirectX9 && !c.issueCount);
+    c = parseText("[Settings]\nRenderer=..\\other\\d3d9.dll\n[Modes]\n7680x1440=60\n");
+    CHECK(c.renderer == Renderer::DirectX9 && c.issueCount == 1);
+
     // An overlong line is skipped; the line after it is still read.
     c = parseText("[Modes]\n" + std::string(600, 'x') + "\n7680x1440=144\n");
     CHECK(c.count == 1 && c.issueCount == 1);

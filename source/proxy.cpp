@@ -9,8 +9,9 @@
 //   else is forwarded unchanged.
 //
 // How it is put together
-//   1. Start-up: work out the log file name, load the real d3d9.dll from the
-//      Windows system directory and read RaceRoomTriple.ini.
+//   1. Start-up: work out the log file name, read RaceRoomTriple.ini and load
+//      the real Direct3D 9: d3d9.dll from the Windows system directory or, if
+//      the INI asks for it, the DXVK that RaceRoom ships.
 //   2. D3DProxy wraps IDirect3D9/IDirect3D9Ex. It extends the mode
 //      enumeration and hands out wrapped devices.
 //   3. DeviceProxy wraps IDirect3DDevice9/IDirect3DDevice9Ex. It refuses
@@ -40,7 +41,8 @@
 // Guards init() so start-up runs once, whichever export is called first.
 static INIT_ONCE initOnce = INIT_ONCE_STATIC_INIT;
 
-// The real Direct3D 9 runtime from the Windows system directory.
+// The real Direct3D 9 that the calls are forwarded to: the runtime from the
+// Windows system directory, or DXVK.
 static HMODULE realDll = nullptr;
 
 // The functions of the real d3d9.dll that this DLL exports under the same
@@ -250,21 +252,86 @@ static void resolve(Fn& entry, const char* name) {
     entry = reinterpret_cast<Fn>(reinterpret_cast<void*>(GetProcAddress(realDll, name)));
 }
 
-// Loads the real runtime by absolute path, so that we never load ourselves,
-// and fills realApi.
-static void loadRealDll() {
+// Loads d3d9.dll from the Windows system directory. The absolute path makes
+// sure that we never load ourselves. Returns null on failure.
+static HMODULE loadSystemDll() {
     constexpr wchar_t fileName[] = L"\\d3d9.dll";
     wchar_t path[MAX_PATH];
     const UINT n = GetSystemDirectoryW(path, MAX_PATH);
     if (!n || n + std::wcslen(fileName) >= MAX_PATH) {
         note("ERROR: Windows system directory not available");
-        return;
+        return nullptr;
     }
     wcscat_s(path, fileName);
-    realDll = LoadLibraryW(path);
-    if (!realDll) {
-        note("ERROR: real d3d9.dll not loaded, winerror=%lu", GetLastError());
-        return;
+    const HMODULE dll = LoadLibraryW(path);
+    if (!dll) note("ERROR: real d3d9.dll not loaded, winerror=%lu", GetLastError());
+    return dll;
+}
+
+// Loads the DXVK that RaceRoom ships for its own DXVK mode. It lies in the
+// folder x64dxvk beside the folder of this DLL:
+//
+//   Game\x64\d3d9.dll        this wrapper
+//   Game\x64dxvk\d3d9.dll    DXVK
+//
+// The game's files stay untouched, and a game update that brings a newer DXVK
+// is picked up without reinstalling anything. Returns null on failure.
+static HMODULE loadDxvk() {
+    // configPath is <folder of this DLL>\RaceRoomTriple.ini. Cut off the file
+    // name and the folder name, then go down into x64dxvk.
+    static wchar_t path[maxPathChars];
+    constexpr wchar_t tail[] = L"\\x64dxvk\\d3d9.dll";
+    wcscpy_s(path, configPath);
+    for (int level = 0; level < 2; ++level) {
+        wchar_t* slash = std::wcsrchr(path, L'\\');
+        if (!slash) {
+            note("ERROR: DXVK folder not found from the path of this DLL");
+            return nullptr;
+        }
+        *slash = 0;
+    }
+    if (std::wcslen(path) + std::wcslen(tail) >= maxPathChars) {
+        note("ERROR: path of the DXVK folder is too long");
+        return nullptr;
+    }
+    wcscat_s(path, tail);
+
+    char utf8[900];
+    if (WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8, sizeof(utf8), nullptr, nullptr))
+        note("RENDERER dxvk path=%s", utf8);
+
+    // The altered search path lets DXVK find the DLLs it depends on in its
+    // own folder first.
+    const HMODULE dll = LoadLibraryExW(path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (!dll) {
+        note("ERROR: DXVK not loaded, winerror=%lu", GetLastError());
+        return nullptr;
+    }
+
+    // If this DLL was copied into x64dxvk itself, the path above leads back to
+    // us. Forwarding to ourselves would never end.
+    HMODULE self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(&moduleAnchor), &self);
+    if (dll == self) {
+        note("ERROR: the DXVK path points to this wrapper; install the wrapper in x64, not in x64dxvk");
+        FreeLibrary(dll);
+        return nullptr;
+    }
+    return dll;
+}
+
+// Loads the real Direct3D 9 chosen in the INI and fills realApi. If DXVK was
+// asked for but cannot be loaded, the game still starts on Direct3D 9.
+static void loadRealDll() {
+    const bool wantDxvk = configured.renderer == rrconfig::Renderer::Dxvk;
+    if (wantDxvk) realDll = loadDxvk();
+    if (realDll) {
+        note("RENDERER active=dxvk");
+    } else {
+        realDll = loadSystemDll();
+        if (!realDll) return;
+        note(wantDxvk ? "RENDERER active=dx9 (fallback, DXVK was requested)" : "RENDERER active=dx9");
     }
 #define RESOLVE(name) resolve(realApi.name, #name)
     RESOLVE(Direct3DCreate9);
@@ -283,12 +350,13 @@ static void loadRealDll() {
 }
 
 // One-time start-up, run through initOnce. The log comes first so that the
-// other steps can report problems.
+// other steps can report problems, and the INI before the real DLL because it
+// says which one to load.
 static BOOL CALLBACK init(PINIT_ONCE, PVOID, PVOID*) {
     prepareLogPath();
-    loadRealDll();
     loadConfig();
     configSummary();
+    loadRealDll();
     return TRUE;
 }
 

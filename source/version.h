@@ -3,5 +3,5 @@
 #pragma once
 
 #define RRT_VERSION_MAJOR 0
-#define RRT_VERSION_MINOR 6
-#define RRT_VERSION "0.6"
+#define RRT_VERSION_MINOR 7
+#define RRT_VERSION "0.7"

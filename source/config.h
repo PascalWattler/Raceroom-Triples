@@ -7,6 +7,8 @@
 //
 //   [Settings]
 //   StrictTripleAspect = true        ; true: sizes must be exactly 48:9
+//   Renderer = dx9                   ; dx9: Direct3D 9 of Windows, dxvk: the
+//                                    ; DXVK that RaceRoom ships
 //
 //   [Modes]
 //   7680x1440 = 60,75,100,120,144    ; WIDTHxHEIGHT = refresh rates in Hz
@@ -38,6 +40,9 @@ enum class Problem { Syntax, SizeOrAspect, Frequency, Capacity, Unknown, LineToo
 // One rejected line.
 struct Issue { unsigned line; Problem reason; };
 
+// Which Direct3D 9 implementation the wrapper hands the game's calls to.
+enum class Renderer { DirectX9, Dxvk };
+
 // The result of parsing.
 struct Config {
     rrpolicy::Mode modes[rrpolicy::maxModes]{};  // accepted modes, in file order
@@ -47,6 +52,7 @@ struct Config {
     unsigned storedIssues = 0;  // problems kept in issues (only the first maxIssues)
     Issue issues[maxIssues]{};
     bool strict = true;         // the StrictTripleAspect setting
+    Renderer renderer = Renderer::DirectX9;  // the Renderer setting
 };
 
 // Records a problem. All are counted, the first maxIssues are kept for the log.
@@ -158,15 +164,21 @@ inline Section sectionHeader(Config& c, char* s, unsigned line, bool report) {
     return Section::Other;
 }
 
-// A line in [Settings]. The only known key is StrictTripleAspect = true|false.
+// A line in [Settings]. Known keys: StrictTripleAspect = true|false and
+// Renderer = dx9|dxvk. The renderer is a fixed choice and not a file name, so
+// the INI cannot make the wrapper load an arbitrary DLL.
 inline void settingLine(Config& c, const char* key, const char* value, unsigned line) {
-    if (!equal(key, "StrictTripleAspect")) {
+    if (equal(key, "StrictTripleAspect")) {
+        if (equal(value, "true")) c.strict = true;
+        else if (equal(value, "false")) c.strict = false;
+        else problem(c, line, Problem::Syntax);
+    } else if (equal(key, "Renderer")) {
+        if (equal(value, "dx9")) c.renderer = Renderer::DirectX9;
+        else if (equal(value, "dxvk")) c.renderer = Renderer::Dxvk;
+        else problem(c, line, Problem::Syntax);
+    } else {
         problem(c, line, Problem::Unknown);
-        return;
     }
-    if (equal(value, "true")) c.strict = true;
-    else if (equal(value, "false")) c.strict = false;
-    else problem(c, line, Problem::Syntax);
 }
 
 // Reads a comma-separated list of refresh rates such as "60,75,144" into
