@@ -2,7 +2,7 @@ RaceRoom Triples
 ================
 
 Triple-screen resolutions for RaceRoom on three separate monitors, without
-NVIDIA Surround. Unofficial community tool by Pascal Wattler.
+NVIDIA Surround or AMD Eyefinity. Unofficial community tool by Pascal Wattler.
 
 Project page, source code and updates:
 https://github.com/PascalWattler/Raceroom-Triples
@@ -27,10 +27,12 @@ licenses\            licenses of the compiler runtime contained in the DLL
 
 WHAT YOU NEED
 -------------
-- The 64-bit version of RaceRoom on Steam, running on Direct3D 9 (not DXVK).
+- The 64-bit version of RaceRoom on Steam. Direct3D 9 is the default; for
+  DXVK see the section DXVK below.
 - Three monitors that Windows uses as an extended desktop.
 - RaceRoom set to Borderless Window. Exclusive fullscreen does not work.
-- No other d3d9.dll in the game folder (for example ReShade or DXVK).
+- No other d3d9.dll in the game folder (for example ReShade, or a DXVK you
+  copied there yourself).
 
 
 INSTALL
@@ -75,7 +77,16 @@ The game shows a D3D9 "unsupported" error at startup:
 
 The new resolutions do not appear:
    Check that the DLL is in Game\x64 next to RRRE64.exe, and that you
-   restarted the game after copying it.
+   restarted the game after copying it. Start the game the normal way, not
+   through Steam's DXVK launch option (see DXVK below).
+
+AMD Radeon RX 5000 or newer, the game freezes, shows a black screen or
+crashes:
+   On Direct3D 9, RaceRoom can do this on these cards when MSAA and motion
+   blur are both enabled, no matter if the wrapper is being used or not. 
+   Disable motion blur (or MSAA) in the video settings before you change
+   the resolution, or switch to DXVK (see DXVK below). This comes from
+   reports by other users; I have no AMD card to test and confirm it.
 
 Windows or your virus scanner warns about the DLL:
    The DLL is not digitally signed. The release page on GitHub lists the
@@ -83,6 +94,8 @@ Windows or your virus scanner warns about the DLL:
 
 The game does not start at all or crashes:
    Remove d3d9.dll from Game\x64. The game then runs as before.
+   Open an issue on github and provide the logfile of the run to help me
+   fixing a potential bug. 
 
 Log file:
    The wrapper writes a log for every game start to
@@ -112,6 +125,23 @@ for example  7680x1440 = 60,120,144.  For sizes that are not exactly 48:9,
 such as a bezel-corrected width, set StrictTripleAspect = false. Save the
 file as plain text and restart the game. All details are on the project
 page.
+
+
+DXVK
+----
+RaceRoom ships DXVK (Direct3D 9 on Vulkan) in the folder Game\x64dxvk.
+Steam's DXVK launch option starts the game from that folder, where the
+wrapper is not loaded. To use the triple resolutions with DXVK:
+
+1. Install the wrapper in Game\x64 as described above.
+2. In RaceRoomTriple.ini, set  Renderer = dxvk  under [Settings].
+3. Start RaceRoom the normal way, NOT via Steam's DXVK launch option.
+
+The wrapper then uses the DXVK from Game\x64dxvk. It changes nothing in
+that folder. Its log shows  RENDERER active=dxvk  when DXVK is in use. If
+DXVK cannot be loaded, the game starts on Direct3D 9 and the log says so.
+
+Tested at 7680 x 1440 with an RTX 5080. Not tested on AMD or Intel cards.
 
 
 SUPPORT
